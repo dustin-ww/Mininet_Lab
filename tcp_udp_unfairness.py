@@ -8,6 +8,9 @@ from mininet.log import setLogLevel, info
 from mininet.cli import CLI
 import time
 import argparse
+import os
+
+from visualize import visualize
 
 # This script sets up a Mininet topology with two TCP and one UDP flows.
 # In detail this mininet topology is rebuild from Sally Floyd's and Kevin Fall's famous paper "Promoting the Use of End-to-End Congestion Control in the Internet" (1999).
@@ -48,12 +51,14 @@ class SimulationTopo(Topo):
         self.addLink(r2, s3, bw=10, delay='10ms')
         self.addLink(r2, s4, bw=0.5, delay='5ms', max_queue_size=self.queue_size)
 
-def runExperiment(queue_size=100, test_duration=120):
+def runExperiment(queue_size=500, test_duration=120):
     # Params for experiment
     tcp_duration = test_duration
     udp_start_delay = 5
     udp_duration = test_duration - udp_start_delay
-    
+
+    result_path = './results/tcp_udp_fairness/queue_' + str(queue_size) + '_duration_' + str(test_duration)
+    os.makedirs(result_path, exist_ok=True) 
     # Create topology with specified queue size
     topo = SimulationTopo(queue_size=queue_size)
     net = Mininet(topo=topo, link=TCLink)
@@ -64,22 +69,22 @@ def runExperiment(queue_size=100, test_duration=120):
     
     # Start iperf3 servers on s4
     # TCP server on port 5201
-    s4.cmd(f'iperf3 -s -p 5201 -D > /tmp/iperf3_tcp_server.log 2>&1')
+    s4.cmd(f'iperf3 -s -p 5201 -D > '+ result_path +'/iperf3_tcp_server.log 2>&1')
     # Start udp server on port 5202
-    s4.cmd(f'iperf3 -s -p 5202 -D > /tmp/iperf3_udp_server.log 2>&1')
+    s4.cmd(f'iperf3 -s -p 5202 -D > '+ result_path +'/iperf3_udp_server.log 2>&1')
     time.sleep(1)
     
     # Ping for monitoring response times and unfairness between TCP (icmp) and UDP flow
-    s1.cmd(f'echo "Start pinging: $(date)" > /tmp/ping_results.log')
-    s1.cmd(f'ping -i 1 -w {test_duration + 5} {server_ip} >> /tmp/ping_results.log 2>&1 &')
+    s1.cmd(f'echo "Start pinging: $(date)" > '+ result_path +' 2>&1')
+    s1.cmd(f'ping -i 1 -w {test_duration + 5} {server_ip} >> '+ result_path +'/ping_result.log 2>&1')
     time.sleep(2)
     
     # s1 -> Runs tcp client
-    s1.cmd(f'iperf3 -c {server_ip} -p 5201 -i 5 -t {tcp_duration} -J > /tmp/iperf3_tcp.json &')
+    s1.cmd(f'iperf3 -c {server_ip} -p 5201 -i 5 -t {tcp_duration} -J > '+ result_path +'/iperf3_tcp.json &')
     
     # s2 -> Runs udp client with short delay
     time.sleep(udp_start_delay)
-    s2.cmd(f'iperf3 -c {server_ip} -p 5202 -u -b 15M --length 100 -i 5 -t {udp_duration} -J > /tmp/iperf3_udp.json &')
+    s2.cmd(f'iperf3 -c {server_ip} -p 5202 -u -b 15M --length 100 -i 5 -t {udp_duration} -J > '+ result_path +'/iperf3_udp.json &')
     
     time.sleep(tcp_duration + 5)
     
@@ -93,7 +98,8 @@ def runExperiment(queue_size=100, test_duration=120):
     info(f"\n*** Experiment completed with parameters:\n")
     info(f"    - Queue size: {queue_size} packets\n")
     info(f"    - Test duration: {test_duration} seconds\n")
-    info("\n*** Results saved in /tmp/\n")
+    info("\n*** Results saved in " + result_path +"\n")
+    visualize(result_path)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run network simulation with configurable parameters')
