@@ -25,7 +25,7 @@ def parse_ping_log(file_path):
                 latency = float(time_part.split('=')[1].replace('ms', ''))
                 seq_to_latency[seq] = latency
             except (ValueError, IndexError, AttributeError) as e:
-                print(f"Error while parsing: {line.strip()} -- {e}")
+                print(f"Fehler beim Parsen: {line.strip()} -- {e}")
                 continue
 
     max_seq = max(seq_to_latency.keys()) if seq_to_latency else 0
@@ -39,7 +39,7 @@ def parse_iperf_json(file_path, offset, is_udp=False):
         with open(file_path, 'r') as f:
             data = json.load(f)
     except (json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"Error while file read {file_path}: {e}")
+        print(f"Error while reading the file {file_path}: {e}")
         return pl.DataFrame({'experiment_time': [], 'throughput_mbps': [], 'drop_rate_pct': [], 'retransmits': []})
 
     times, throughputs, drop_rates, retransmits = [], [], [], []
@@ -61,8 +61,10 @@ def parse_iperf_json(file_path, offset, is_udp=False):
             for st in interval.get('streams', []):
                 udp = st.get('udp', {})
                 lost += udp.get('lost_packets', 0)
-                pkts += udp.get('packets', 0)
-            drop_pct = (lost / (lost + pkts) * 100) if (lost + pkts) > 0 else 0
+                received = udp.get('packets', 0)
+                pkts += (lost + received)
+            drop_pct = (lost / pkts * 100) if pkts > 0 else 0
+
         else:
             packets = sum_data.get('bytes', 0) / MSS_BYTES if sum_data.get('bytes', 0) > 0 else 0
             drop_pct = (rtx / packets * 100) if packets > 0 else 0
@@ -90,16 +92,14 @@ def parse_iperf_json(file_path, offset, is_udp=False):
         'retransmits': retransmits
     })
 
-# -------------------------
-# Main Function
-# -------------------------
+
 def visualize(path, name='network_metrics_extended'):
     ping_log_path = os.path.join(path, 'ping_result.log')
     tcp_json_path = os.path.join(path, 'iperf3_tcp.json')
     udp_json_path = os.path.join(path, 'iperf3_udp.json')
     output_path = os.path.join(path, f'{name}.png')
 
-    print(f"Verarbeite Dateien in: {path}")
+    print(f"Using files from: {path}")
     ping_df = parse_ping_log(ping_log_path)
     tcp_df = parse_iperf_json(tcp_json_path, offset=3, is_udp=False)
     udp_df = parse_iperf_json(udp_json_path, offset=8, is_udp=True)
@@ -108,7 +108,7 @@ def visualize(path, name='network_metrics_extended'):
 
     plt.figure(figsize=(12, 10))
 
-    # 1) Latency
+    # 1) Latenz
     plt.subplot(4, 1, 1)
     if len(ping_df) > 0:
         valid_pings = ping_df.filter(~pl.col("latency_ms").is_nan())
@@ -124,7 +124,7 @@ def visualize(path, name='network_metrics_extended'):
     plt.grid(True)
     plt.legend()
 
-    # 2) TCP/UDP Throughput
+    # 2) Durchsatz
     plt.subplot(4, 1, 2)
     if len(tcp_df) > 0:
         plt.plot(tcp_df['experiment_time'], tcp_df['throughput_mbps'], label='TCP Durchsatz')
@@ -134,7 +134,7 @@ def visualize(path, name='network_metrics_extended'):
     plt.grid(True)
     plt.legend()
 
-    # 3) TCP Retransmits and drop-rate
+    # 3) TCP Retransmissions + Drop-Rate
     plt.subplot(4, 1, 3)
     if len(tcp_df) > 0:
         plt.plot(tcp_df['experiment_time'], tcp_df['retransmits'], label='TCP Retransmits')
@@ -146,7 +146,7 @@ def visualize(path, name='network_metrics_extended'):
     plt.grid(True)
     plt.legend()
 
-    # 4) UDP drop-rate
+    # 4) UDP Drop-Rate
     plt.subplot(4, 1, 4)
     if len(udp_df) > 0:
         plt.plot(udp_df['experiment_time'], udp_df['drop_rate_pct'], label='UDP Drop-Rate (%)')
@@ -160,11 +160,12 @@ def visualize(path, name='network_metrics_extended'):
     print(f"Diagram saved in: {output_path}")
     plt.show()
 
-# CLI Usage
+
+# cli usage
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Visualize network metrics from iperf3 and ping logs')
-    parser.add_argument('--path', '-p', type=str, default='/tmp', help='Path to the directory containing the log files')
-    parser.add_argument('--name', '-n', type=str, default='network_metrics_extended', help='Name for the output image file')
+    parser = argparse.ArgumentParser(description='Visualisiere Netzwerkmetriken')
+    parser.add_argument('--path', '-p', type=str, default='/tmp', help='Pfad zum Ergebnisordner')
+    parser.add_argument('--name', '-n', type=str, default='network_metrics_extended', help='Name der Ausgabedatei')
     args = parser.parse_args()
     visualize(args.path, args.name)

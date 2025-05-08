@@ -51,7 +51,7 @@ class SimulationTopo(Topo):
         self.addLink(r2, s3, bw=10, delay='10ms')
         self.addLink(r2, s4, bw=0.5, delay='5ms', max_queue_size=self.queue_size)
 
-def runExperiment(queue_size=500, test_duration=120):
+def runExperiment(queue_size=100, test_duration=30):
     # Params for experiment
     tcp_duration = test_duration
     udp_start_delay = 5
@@ -69,14 +69,14 @@ def runExperiment(queue_size=500, test_duration=120):
     
     # Start iperf3 servers on s4
     # TCP server on port 5201
-    s4.cmd(f'iperf3 -s -p 5201 -D > '+ result_path +'/iperf3_tcp_server.log 2>&1')
+    s4.cmd(f'iperf3 -s -p 5201 -J > '+ result_path +'/iperf3_tcp_server.log 2>&1 &')
     # Start udp server on port 5202
-    s4.cmd(f'iperf3 -s -p 5202 -D > '+ result_path +'/iperf3_udp_server.log 2>&1')
+    s4.cmd(f'iperf3 -s -p 5202 -J > '+ result_path +'/iperf3_udp_server.log 2>&1 &')
     time.sleep(1)
     
     # Ping for monitoring response times and unfairness between TCP (icmp) and UDP flow
     s1.cmd(f'echo "Start pinging: $(date)" > '+ result_path +' 2>&1')
-    s1.cmd(f'ping -i 1 -w {test_duration + 5} {server_ip} >> '+ result_path +'/ping_result.log 2>&1')
+    s1.cmd(f'ping -i 1 -w {test_duration + 5} {server_ip} >> '+ result_path +'/ping_result.log 2>&1 &')
     time.sleep(2)
     
     # s1 -> Runs tcp client
