@@ -105,7 +105,6 @@ def runSingleExperiment(queue_size=100, test_duration=30, iteration=1, result_ba
     return result_path
 
 def runExperiment(queue_size=100, test_duration=30, iterations=1):
-    # Create base directory for this experiment configuration
     result_base_path = './results/tcp_udp_fairness'
     os.makedirs(result_base_path, exist_ok=True)
     
@@ -131,7 +130,7 @@ def runExperiment(queue_size=100, test_duration=30, iterations=1):
             info(f"\n*** Waiting 5 seconds before next iteration...\n")
             time.sleep(5)
     
-    # Create a summary directory for the entire experiment
+    # Create a summary dir
     summary_dir = f'{result_base_path}/queue_{queue_size}_duration_{test_duration}_summary'
     os.makedirs(summary_dir, exist_ok=True)
     
@@ -152,6 +151,7 @@ def runExperiment(queue_size=100, test_duration=30, iterations=1):
     info(f"    - Summary saved in {summary_dir}\n")
     
     # TODO: Add visualization of results
+    # For now, just visualize the last iteration
     visualize(iteration_results[-1])
 
 if __name__ == '__main__':
