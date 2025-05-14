@@ -174,6 +174,8 @@ def parse_iperf_json(file_path, offset, is_udp=False, is_server=False):
     }
     max_length = max(series_lengths.values())
 
+    
+
     # Truncate or pad each series to match the max length
     def adjust_length(series, target_length, pad_value=None):
         if len(series) > target_length:
@@ -217,6 +219,16 @@ def parse_iperf_json(file_path, offset, is_udp=False, is_server=False):
     
     # Return the DataFrame
     return pl.DataFrame(df_dict)
+
+
+def calculate_moving_average(data, window_size=3):
+    """Calculate moving average to smooth out spikes with proper padding"""
+    # Pad the array at the edges to maintain length
+    pad_width = window_size // 2
+    padded_data = np.pad(data, (pad_width, pad_width), mode='edge')
+    weights = np.ones(window_size) / window_size
+    smoothed = np.convolve(padded_data, weights, mode='valid')
+    return smoothed
 
 def align_dataframes(df_list, time_column='experiment_time'):
     """Standardize experiment times across iterations to allow averaging"""
@@ -491,23 +503,31 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     # 6) Fairness Index
     plt.subplot(n_plots, 1, 6)
     if tcp_stats is not None and not tcp_stats.is_empty() and udp_stats is not None and not udp_stats.is_empty():
-        tcp_throughput = np.array(tcp_stats['throughput_mbps_mean'])
-        udp_throughput = np.array(udp_stats['throughput_mbps_mean'])
+        # Ensure both arrays have the same length
+        min_length = min(len(tcp_stats['throughput_mbps_mean']), len(udp_stats['throughput_mbps_mean']))
+        tcp_throughput = np.array(tcp_stats['throughput_mbps_mean'])[:min_length]
+        udp_throughput = np.array(udp_stats['throughput_mbps_mean'])[:min_length]
+        experiment_time = np.array(tcp_stats['experiment_time'])[:min_length]
+        
+        # Calculate fairness index
         _, _, jain_index = calculate_fairness_metrics(tcp_throughput, udp_throughput)
         
-        # Ensure dimensions match
-        experiment_time = tcp_stats['experiment_time']
-        if len(experiment_time) != len(jain_index):
-            min_length = min(len(experiment_time), len(jain_index))
-            experiment_time = experiment_time[:min_length]
-            jain_index = jain_index[:min_length]
-            print("Warning: Mismatched dimensions for Jain's Fairness Index plot. Data truncated.")
-
-        plt.plot(experiment_time, jain_index, label="Jain's Fairness Index", color='purple')
-    plt.ylabel('Fairness Index')
-    plt.xlabel('Experiment Time (s)')
-    plt.grid(True)
-    plt.legend()
+        # Apply smoothing while maintaining the same length
+        window_size = 15  # Increased window size for stronger smoothing
+        smoothed_index = calculate_moving_average(jain_index, window_size)
+        
+        # Plot both smoothed and raw data
+        plt.plot(experiment_time, smoothed_index, 
+                label="Jain's Fairness Index (Smoothed)", 
+                color='purple', linewidth=2)
+        plt.plot(experiment_time, jain_index, 
+                label="Jain's Fairness Index (Raw)", 
+                color='purple', alpha=0.3, linewidth=0.5)
+        
+        plt.ylabel("Jain's Fairness Index")
+        plt.ylim(0, 1)  # Fairness Index is always between 0 and 1
+        plt.grid(True)
+        plt.legend()
 
     # Save the summary plot
     plt.tight_layout()
@@ -603,13 +623,30 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
         # 6) Fairness Index (if both TCP and UDP data are available)
         if not tcp_df.is_empty() and not udp_df.is_empty():
             plt.subplot(n_indiv_plots, 1, 6)
-            tcp_throughput = np.array(tcp_df['throughput_mbps'])
-            udp_throughput = np.array(udp_df['throughput_mbps'])
+            
+            # Ensure both arrays have the same length
+            min_length = min(len(tcp_df['throughput_mbps']), len(udp_df['throughput_mbps']))
+            tcp_throughput = np.array(tcp_df['throughput_mbps'])[:min_length]
+            udp_throughput = np.array(udp_df['throughput_mbps'])[:min_length]
+            experiment_time = np.array(tcp_df['experiment_time'])[:min_length]
+            
+            # Calculate fairness index
             _, _, jain_index = calculate_fairness_metrics(tcp_throughput, udp_throughput)
-            experiment_time = tcp_df['experiment_time'][:len(jain_index)]
-            plt.plot(experiment_time, jain_index, label="Jain's Fairness Index", color='purple')
-            plt.ylabel('Fairness Index')
-            plt.xlabel('Experiment Time (s)')
+            
+            # Apply smoothing while maintaining the same length
+            window_size = 15  # Increased window size for stronger smoothing
+            smoothed_index = calculate_moving_average(jain_index, window_size)
+            
+            # Plot both smoothed and raw data
+            plt.plot(experiment_time, smoothed_index, 
+                    label="Jain's Fairness Index (Smoothed)", 
+                    color='purple', linewidth=2)
+            plt.plot(experiment_time, jain_index, 
+                    label="Jain's Fairness Index (Raw)", 
+                    color='purple', alpha=0.3, linewidth=0.5)
+            
+            plt.ylabel("Jain's Fairness Index")
+            plt.ylim(0, 1)  # Fairness Index is always between 0 and 1
             plt.grid(True)
             plt.legend()
 
