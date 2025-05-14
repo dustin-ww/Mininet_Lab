@@ -39,63 +39,103 @@ def parse_ping_log(file_path):
 
     return pl.DataFrame({'experiment_time': exp_times, 'latency_ms': latencies})
 
-def parse_iperf_json(file_path, offset, is_udp=False):
+def parse_iperf_json(file_path, offset, is_udp=False, is_server=False):
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
     except (json.JSONDecodeError, FileNotFoundError) as e:
         print(f"Error while reading the file {file_path}: {e}")
-        return pl.DataFrame({'experiment_time': [], 'throughput_mbps': [], 'drop_rate_pct': [], 'retransmits': []})
+        return pl.DataFrame({
+            'experiment_time': [], 
+            'throughput_mbps': [], 
+            'drop_rate_pct': [], 
+            'retransmits': [],
+            'jitter_ms': [], 
+            'received_bytes': []
+        })
 
     times, throughputs, drop_rates, retransmits = [], [], [], []
+    jitters, received_bytes = [], []
 
     for interval in data.get('intervals', []):
         sum_data = interval.get('sum', {})
         duration = sum_data.get('end', 0) - sum_data.get('start', 0)
         if duration <= 0:
             continue
-        t = offset + sum_data['end']
-        tp = (sum_data.get('bytes', 0) * 8) / (duration * 1e6)
+        t = float(offset + sum_data['end'])
+        tp = float((sum_data.get('bytes', 0) * 8) / (duration * 1e6))
         times.append(t)
         throughputs.append(tp)
-        rtx = sum_data.get('retransmits', 0) if not is_udp else 0
+        rtx = int(sum_data.get('retransmits', 0)) if not is_udp else 0
         retransmits.append(rtx)
+        
+        # Add server-specific data points
+        if is_server:
+            if is_udp:
+                jitter_val = float(0)
+                for st in interval.get('streams', []):
+                    udp = st.get('udp', {})
+                    jitter_val = float(udp.get('jitter_ms', 0))
+                jitters.append(jitter_val)
+            else:
+                jitters.append(float(0))
+            received_bytes.append(int(sum_data.get('bytes', 0)))
 
         if is_udp:
             lost, pkts = 0, 0
             for st in interval.get('streams', []):
                 udp = st.get('udp', {})
-                lost += udp.get('lost_packets', 0)
-                received = udp.get('packets', 0)
+                lost += int(udp.get('lost_packets', 0))
+                received = int(udp.get('packets', 0))
                 pkts += (lost + received)
-            drop_pct = (lost / pkts * 100) if pkts > 0 else 0
-
+            drop_pct = float(lost / pkts * 100) if pkts > 0 else 0.0
         else:
-            packets = sum_data.get('bytes', 0) / MSS_BYTES if sum_data.get('bytes', 0) > 0 else 0
-            drop_pct = (rtx / packets * 100) if packets > 0 else 0
+            packets = int(sum_data.get('bytes', 0) / MSS_BYTES) if sum_data.get('bytes', 0) > 0 else 0
+            drop_pct = float(rtx / packets * 100) if packets > 0 else 0.0
         drop_rates.append(drop_pct)
 
     if 'end' in data and 'sum' in data['end']:
         end = data['end']['sum']
-        t = offset + end.get('end', 0)
-        tp = end.get('bits_per_second', 0) / 1e6
+        t = float(offset + end.get('end', 0))
+        tp = float(end.get('bits_per_second', 0) / 1e6)
         times.append(t)
         throughputs.append(tp)
+        
+        if is_server:
+            if is_udp:
+                jitter_val = float(0)
+                if 'streams' in data['end']:
+                    for st in data['end']['streams']:
+                        udp = st.get('udp', {})
+                        jitter_val = float(udp.get('jitter_ms', 0))
+                jitters.append(jitter_val)
+            else:
+                jitters.append(float(0))
+            received_bytes.append(int(end.get('bytes', 0)))
+            
         if is_udp:
-            drop_rates.append(end.get('lost_percent', 0))
+            drop_rates.append(float(end.get('lost_percent', 0)))
             retransmits.append(0)
         else:
-            rtx = end.get('retransmits', 0)
+            rtx = int(end.get('retransmits', 0))
             retransmits.append(rtx)
-            packets = end.get('bytes', 0) / MSS_BYTES if end.get('bytes', 0) > 0 else 0
-            drop_rates.append((rtx / packets * 100) if packets > 0 else 0)
+            packets = int(end.get('bytes', 0) / MSS_BYTES) if end.get('bytes', 0) > 0 else 0
+            drop_pct = float(rtx / packets * 100) if packets > 0 else 0.0
+            drop_rates.append(drop_pct)
 
-    return pl.DataFrame({
-        'experiment_time': times,
-        'throughput_mbps': throughputs,
-        'drop_rate_pct': drop_rates,
-        'retransmits': retransmits
-    })
+    df_dict = {
+        'experiment_time': pl.Series(times, dtype=pl.Float64),
+        'throughput_mbps': pl.Series(throughputs, dtype=pl.Float64),
+        'drop_rate_pct': pl.Series(drop_rates, dtype=pl.Float64),
+        'retransmits': pl.Series(retransmits, dtype=pl.Int64)
+    }
+    
+    # Add server-specific columns if this is server data
+    if is_server:
+        df_dict['jitter_ms'] = pl.Series(jitters, dtype=pl.Float64)
+        df_dict['received_bytes'] = pl.Series(received_bytes, dtype=pl.Int64)
+        
+    return pl.DataFrame(df_dict)
 
 def align_dataframes(df_list, time_column='experiment_time'):
     """Standardize experiment times across iterations to allow averaging"""
@@ -193,33 +233,46 @@ def collect_iteration_data(base_path):
             ping_df = parse_ping_log(os.path.join(base_path, 'ping_result.log'))
             tcp_df = parse_iperf_json(os.path.join(base_path, 'iperf3_tcp.json'), offset=3, is_udp=False)
             udp_df = parse_iperf_json(os.path.join(base_path, 'iperf3_udp.json'), offset=8, is_udp=True)
-            return [ping_df], [tcp_df], [udp_df], 1
+            
+            # Add server side data if available
+            tcp_server_df = parse_iperf_json(os.path.join(base_path, 'iperf3_tcp_server.log'), offset=3, is_udp=False, is_server=True)
+            udp_server_df = parse_iperf_json(os.path.join(base_path, 'iperf3_udp_server.log'), offset=8, is_udp=True, is_server=True)
+            
+            return [ping_df], [tcp_df], [udp_df], [tcp_server_df], [udp_server_df], 1
         else:
             print(f"No data files found in {base_path}")
-            return [], [], [], 0
+            return [], [], [], [], [], 0
     
     ping_dfs = []
     tcp_dfs = []
     udp_dfs = []
+    tcp_server_dfs = []
+    udp_server_dfs = []
     
     for iteration_dir in iteration_dirs:
         ping_log = os.path.join(iteration_dir, 'ping_result.log')
         tcp_json = os.path.join(iteration_dir, 'iperf3_tcp.json')
         udp_json = os.path.join(iteration_dir, 'iperf3_udp.json')
+        tcp_server_json = os.path.join(iteration_dir, 'iperf3_tcp_server.log')
+        udp_server_json = os.path.join(iteration_dir, 'iperf3_udp_server.log')
         
         ping_df = parse_ping_log(ping_log)
         tcp_df = parse_iperf_json(tcp_json, offset=3, is_udp=False)
         udp_df = parse_iperf_json(udp_json, offset=8, is_udp=True)
+        tcp_server_df = parse_iperf_json(tcp_server_json, offset=3, is_udp=False, is_server=True)
+        udp_server_df = parse_iperf_json(udp_server_json, offset=8, is_udp=True, is_server=True)
         
         ping_dfs.append(ping_df)
         tcp_dfs.append(tcp_df)
         udp_dfs.append(udp_df)
+        tcp_server_dfs.append(tcp_server_df)
+        udp_server_dfs.append(udp_server_df)
     
-    return ping_dfs, tcp_dfs, udp_dfs, len(iteration_dirs)
+    return ping_dfs, tcp_dfs, udp_dfs, tcp_server_dfs, udp_server_dfs, len(iteration_dirs)
 
 def visualize_iterations(base_path, name='network_metrics_iterations'):
     print(f"Collecting data from iterations in: {base_path}")
-    ping_dfs, tcp_dfs, udp_dfs, num_iterations = collect_iteration_data(base_path)
+    ping_dfs, tcp_dfs, udp_dfs, tcp_server_dfs, udp_server_dfs, num_iterations = collect_iteration_data(base_path)
     
     if num_iterations == 0:
         print("No data found to visualize.")
@@ -232,11 +285,19 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     tcp_stats = calculate_statistics(tcp_dfs, ['throughput_mbps', 'drop_rate_pct', 'retransmits'])
     udp_stats = calculate_statistics(udp_dfs, ['throughput_mbps', 'drop_rate_pct'])
     
-    # Generate plot
-    plt.figure(figsize=(12, 12))
+    # Calculate server statistics if available
+    tcp_server_stats = calculate_statistics(tcp_server_dfs, ['throughput_mbps', 'drop_rate_pct', 'retransmits', 'received_bytes'])
+    udp_server_stats = calculate_statistics(udp_server_dfs, ['throughput_mbps', 'drop_rate_pct', 'jitter_ms', 'received_bytes'])
+    
+    has_server_data = tcp_server_stats is not None and not tcp_server_stats.is_empty() or \
+                     udp_server_stats is not None and not udp_server_stats.is_empty()
+    
+    # Update plot height based on available data
+    n_plots = 6 if has_server_data else 4
+    plt.figure(figsize=(12, 3 * n_plots))
     
     # 1) Latency
-    plt.subplot(4, 1, 1)
+    plt.subplot(n_plots, 1, 1)
     if ping_stats is not None and not ping_stats.is_empty():
         plt.plot(ping_stats['experiment_time'], ping_stats['latency_ms_mean'], 
                  label='Mean Ping Latency', color='blue')
@@ -249,11 +310,11 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     plt.grid(True)
     plt.legend()
     
-    # 2) Throughput
-    plt.subplot(4, 1, 2)
+    # 2) Throughput (Client)
+    plt.subplot(n_plots, 1, 2)
     if tcp_stats is not None and not tcp_stats.is_empty():
         plt.plot(tcp_stats['experiment_time'], tcp_stats['throughput_mbps_mean'], 
-                 label='Mean TCP Throughput', color='green')
+                 label='Mean TCP Throughput (Client)', color='green')
         plt.fill_between(tcp_stats['experiment_time'], 
                          np.array(tcp_stats['throughput_mbps_mean']) - np.array(tcp_stats['throughput_mbps_std']),
                          np.array(tcp_stats['throughput_mbps_mean']) + np.array(tcp_stats['throughput_mbps_std']),
@@ -261,7 +322,7 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     
     if udp_stats is not None and not udp_stats.is_empty():
         plt.plot(udp_stats['experiment_time'], udp_stats['throughput_mbps_mean'], 
-                 label='Mean UDP Throughput', color='orange')
+                 label='Mean UDP Throughput (Client)', color='orange')
         plt.fill_between(udp_stats['experiment_time'], 
                          np.array(udp_stats['throughput_mbps_mean']) - np.array(udp_stats['throughput_mbps_std']),
                          np.array(udp_stats['throughput_mbps_mean']) + np.array(udp_stats['throughput_mbps_std']),
@@ -270,11 +331,11 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     plt.grid(True)
     plt.legend()
     
-    # 3) TCP Retransmissions + Drop-Rate
-    plt.subplot(4, 1, 3)
+    # 3) TCP Retransmissions + Drop-Rate (Client)
+    plt.subplot(n_plots, 1, 3)
     if tcp_stats is not None and not tcp_stats.is_empty():
         plt.plot(tcp_stats['experiment_time'], tcp_stats['retransmits_mean'], 
-                 label='Mean TCP Retransmits', color='blue')
+                 label='Mean TCP Retransmits (Client)', color='blue')
         plt.fill_between(tcp_stats['experiment_time'], 
                          np.array(tcp_stats['retransmits_mean']) - np.array(tcp_stats['retransmits_std']),
                          np.array(tcp_stats['retransmits_mean']) + np.array(tcp_stats['retransmits_std']),
@@ -282,7 +343,7 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
         
         plt_twin = plt.twinx()
         plt_twin.plot(tcp_stats['experiment_time'], tcp_stats['drop_rate_pct_mean'], 
-                      label='Mean TCP Drop Rate (%)', color='red', linestyle='--')
+                      label='Mean TCP Drop Rate % (Client)', color='red', linestyle='--')
         plt_twin.fill_between(tcp_stats['experiment_time'], 
                              np.array(tcp_stats['drop_rate_pct_mean']) - np.array(tcp_stats['drop_rate_pct_std']),
                              np.array(tcp_stats['drop_rate_pct_mean']) + np.array(tcp_stats['drop_rate_pct_std']),
@@ -293,19 +354,72 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     plt.grid(True)
     plt.legend()
     
-    # 4) UDP Drop-Rate
-    plt.subplot(4, 1, 4)
+    # 4) UDP Drop-Rate (Client)
+    plt.subplot(n_plots, 1, 4)
     if udp_stats is not None and not udp_stats.is_empty():
         plt.plot(udp_stats['experiment_time'], udp_stats['drop_rate_pct_mean'], 
-                 label='Mean UDP Drop Rate (%)', color='purple')
+                 label='Mean UDP Drop Rate % (Client)', color='purple')
         plt.fill_between(udp_stats['experiment_time'], 
                          np.array(udp_stats['drop_rate_pct_mean']) - np.array(udp_stats['drop_rate_pct_std']),
                          np.array(udp_stats['drop_rate_pct_mean']) + np.array(udp_stats['drop_rate_pct_std']),
                          alpha=0.3, color='purple')
     plt.ylabel('Drop Rate (%)')
-    plt.xlabel('Experiment Time (s)')
     plt.grid(True)
     plt.legend()
+    
+    # Additional server plots if data is available
+    if has_server_data:
+        # 5) Server Throughput Comparison
+        plt.subplot(n_plots, 1, 5)
+        if tcp_server_stats is not None and not tcp_server_stats.is_empty():
+            plt.plot(tcp_server_stats['experiment_time'], tcp_server_stats['throughput_mbps_mean'], 
+                    label='Mean TCP Throughput (Server)', color='darkgreen')
+            plt.fill_between(tcp_server_stats['experiment_time'], 
+                            np.array(tcp_server_stats['throughput_mbps_mean']) - np.array(tcp_server_stats['throughput_mbps_std']),
+                            np.array(tcp_server_stats['throughput_mbps_mean']) + np.array(tcp_server_stats['throughput_mbps_std']),
+                            alpha=0.3, color='darkgreen')
+        
+        if udp_server_stats is not None and not udp_server_stats.is_empty():
+            plt.plot(udp_server_stats['experiment_time'], udp_server_stats['throughput_mbps_mean'], 
+                    label='Mean UDP Throughput (Server)', color='darkorange')
+            plt.fill_between(udp_server_stats['experiment_time'], 
+                            np.array(udp_server_stats['throughput_mbps_mean']) - np.array(udp_server_stats['throughput_mbps_std']),
+                            np.array(udp_server_stats['throughput_mbps_mean']) + np.array(udp_server_stats['throughput_mbps_std']),
+                            alpha=0.3, color='darkorange')
+        plt.ylabel('Throughput (Mbps)')
+        plt.grid(True)
+        plt.legend()
+        
+        # 6) UDP Jitter (Server) and Received Bytes Comparison
+        plt.subplot(n_plots, 1, 6)
+        
+        if udp_server_stats is not None and not udp_server_stats.is_empty() and 'jitter_ms_mean' in udp_server_stats.columns:
+            plt.plot(udp_server_stats['experiment_time'], udp_server_stats['jitter_ms_mean'], 
+                    label='Mean UDP Jitter (Server)', color='blue')
+            plt.fill_between(udp_server_stats['experiment_time'], 
+                            np.array(udp_server_stats['jitter_ms_mean']) - np.array(udp_server_stats['jitter_ms_std']),
+                            np.array(udp_server_stats['jitter_ms_mean']) + np.array(udp_server_stats['jitter_ms_std']),
+                            alpha=0.3, color='blue')
+            plt.ylabel('Jitter (ms)')
+            
+            # Add received bytes comparison if available (right axis)
+            if 'received_bytes_mean' in udp_server_stats.columns and 'received_bytes_mean' in tcp_server_stats.columns:
+                plt_twin = plt.twinx()
+                plt_twin.plot(tcp_server_stats['experiment_time'], 
+                             np.array(tcp_server_stats['received_bytes_mean']) / 1024, 
+                             label='TCP Received (KB)', color='green', linestyle='-.')
+                plt_twin.plot(udp_server_stats['experiment_time'], 
+                             np.array(udp_server_stats['received_bytes_mean']) / 1024, 
+                             label='UDP Received (KB)', color='orange', linestyle='-.')
+                plt_twin.set_ylabel('Received (KB)', color='black')
+                plt_twin.legend(loc='upper right')
+        plt.grid(True)
+        plt.legend(loc='upper left')
+        plt.xlabel('Experiment Time (s)')
+    else:
+        # If no server data, add x-axis label to the 4th plot
+        plt.subplot(n_plots, 1, 4)
+        plt.xlabel('Experiment Time (s)')
     
     plt.tight_layout()
     
@@ -328,13 +442,24 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
     if udp_stats is not None and not udp_stats.is_empty():
         udp_stats.write_csv(os.path.join(summary_dir, "udp_statistics.csv"))
     
+    # Save server statistics if available
+    if tcp_server_stats is not None and not tcp_server_stats.is_empty():
+        tcp_server_stats.write_csv(os.path.join(summary_dir, "tcp_server_statistics.csv"))
+    if udp_server_stats is not None and not udp_server_stats.is_empty():
+        udp_server_stats.write_csv(os.path.join(summary_dir, "udp_server_statistics.csv"))
+    
     # Also create individual iteration plots
     if num_iterations > 1:
-        for i, (ping_df, tcp_df, udp_df) in enumerate(zip(ping_dfs, tcp_dfs, udp_dfs), 1):
-            plt.figure(figsize=(12, 10))
+        for i, (ping_df, tcp_df, udp_df, tcp_server_df, udp_server_df) in enumerate(
+            zip(ping_dfs, tcp_dfs, udp_dfs, tcp_server_dfs, udp_server_dfs), 1):
             
-            # 1) Latenz
-            plt.subplot(4, 1, 1)
+            has_indiv_server_data = not tcp_server_df.is_empty() or not udp_server_df.is_empty()
+            n_indiv_plots = 6 if has_indiv_server_data else 4
+            
+            plt.figure(figsize=(12, 3 * n_indiv_plots))
+            
+            # 1) Latency
+            plt.subplot(n_indiv_plots, 1, 1)
             if not ping_df.is_empty():
                 valid_pings = ping_df.filter(~pl.col("latency_ms").is_nan())
                 plt.plot(valid_pings['experiment_time'], valid_pings['latency_ms'], label=f'Ping Latency', color='blue')
@@ -349,152 +474,96 @@ def visualize_iterations(base_path, name='network_metrics_iterations'):
             plt.grid(True)
             plt.legend()
             
-            # 2) Durchsatz
-            plt.subplot(4, 1, 2)
+            # 2) Client Throughput
+            plt.subplot(n_indiv_plots, 1, 2)
             if not tcp_df.is_empty():
-                plt.plot(tcp_df['experiment_time'], tcp_df['throughput_mbps'], label='TCP Throughput')
+                plt.plot(tcp_df['experiment_time'], tcp_df['throughput_mbps'], label='TCP Throughput (Client)')
             if not udp_df.is_empty():
-                plt.plot(udp_df['experiment_time'], udp_df['throughput_mbps'], label='UDP Throughput')
+                plt.plot(udp_df['experiment_time'], udp_df['throughput_mbps'], label='UDP Throughput (Client)')
             plt.ylabel('Throughput (Mbps)')
             plt.grid(True)
             plt.legend()
             
-            # 3) TCP Retransmissions + Drop-Rate
-            plt.subplot(4, 1, 3)
+            # 3) TCP Client Retransmissions + Drop-Rate
+            plt.subplot(n_indiv_plots, 1, 3)
             if not tcp_df.is_empty():
-                plt.plot(tcp_df['experiment_time'], tcp_df['retransmits'], label='TCP Retransmits')
+                plt.plot(tcp_df['experiment_time'], tcp_df['retransmits'], label='TCP Retransmits (Client)')
                 plt_twin = plt.twinx()
-                plt_twin.plot(tcp_df['experiment_time'], tcp_df['drop_rate_pct'], label='TCP Drop Rate (%)', color='red', linestyle='--')
+                plt_twin.plot(tcp_df['experiment_time'], tcp_df['drop_rate_pct'], label='TCP Drop Rate % (Client)', color='red', linestyle='--')
                 plt_twin.set_ylabel('Drop Rate (%)', color='red')
                 plt_twin.tick_params(axis='y', labelcolor='red')
             plt.ylabel('Retransmits')
             plt.grid(True)
             plt.legend()
             
-            # 4) UDP Drop-Rate
-            plt.subplot(4, 1, 4)
+            # 4) UDP Client Drop-Rate
+            plt.subplot(n_indiv_plots, 1, 4)
             if not udp_df.is_empty():
-                plt.plot(udp_df['experiment_time'], udp_df['drop_rate_pct'], label='UDP Drop Rate (%)')
+                plt.plot(udp_df['experiment_time'], udp_df['drop_rate_pct'], label='UDP Drop Rate % (Client)')
             plt.ylabel('Drop Rate (%)')
-            plt.xlabel('Experiment Time (s)')
             plt.grid(True)
             plt.legend()
             
+            # Add server plots if data is available
+            if has_indiv_server_data:
+                # 5) Server Throughput Comparison
+                plt.subplot(n_indiv_plots, 1, 5)
+                if not tcp_server_df.is_empty():
+                    plt.plot(tcp_server_df['experiment_time'], tcp_server_df['throughput_mbps'], 
+                            label='TCP Throughput (Server)', color='darkgreen')
+                
+                if not udp_server_df.is_empty():
+                    plt.plot(udp_server_df['experiment_time'], udp_server_df['throughput_mbps'], 
+                            label='UDP Throughput (Server)', color='darkorange')
+                plt.ylabel('Throughput (Mbps)')
+                plt.grid(True)
+                plt.legend()
+                
+                # 6) Server UDP Jitter and Received Bytes
+                               # 6) Server UDP Jitter and Received Bytes
+                plt.subplot(n_indiv_plots, 1, 6)
+                
+                if not udp_server_df.is_empty() and 'jitter_ms' in udp_server_df.columns:
+                    plt.plot(udp_server_df['experiment_time'], udp_server_df['jitter_ms'], 
+                            label='UDP Jitter (Server)', color='blue')
+                    plt.ylabel('Jitter (ms)')
+                    
+                    # Add received bytes comparison on right axis
+                    if 'received_bytes' in udp_server_df.columns and 'received_bytes' in tcp_server_df.columns:
+                        plt_twin = plt.twinx()
+                        plt_twin.plot(tcp_server_df['experiment_time'], 
+                                    np.array(tcp_server_df['received_bytes']) / 1024, 
+                                    label='TCP Received (KB)', color='green', linestyle='-.')
+                        plt_twin.plot(udp_server_df['experiment_time'], 
+                                    np.array(udp_server_df['received_bytes']) / 1024, 
+                                    label='UDP Received (KB)', color='orange', linestyle='-.')
+                        plt_twin.set_ylabel('Received (KB)', color='black')
+                        plt_twin.legend(loc='upper right')
+                plt.grid(True)
+                plt.legend(loc='upper left')
+                plt.xlabel('Experiment Time (s)')
+            else:
+                # If no server data, add x-axis label to the 4th plot
+                plt.subplot(n_indiv_plots, 1, 4)
+                plt.xlabel('Experiment Time (s)')
+            
             plt.tight_layout()
-            iteration_path = os.path.join(summary_dir, f"iteration_{i}_{name}.png")
-            plt.savefig(iteration_path)
+            
+            # Save individual iteration plot
+            output_path = os.path.join(summary_dir, f"{name}_iteration_{i}.png")
+            plt.savefig(output_path)
             plt.close()
-            
-    return summary_dir
+            print(f"Iteration {i} visualization saved in: {output_path}")
 
-def visualize(path, name='network_metrics_extended'):
-    """
-    Enhanced visualize function that can handle both single runs and iterations
-    """
-    # Check if this is an iteration-based experiment or a single run
-    iteration_dirs = glob.glob(os.path.join(path, 'iteration_*'))
-    
-    if iteration_dirs:
-        # This is an iteration-based experiment
-        print(f"Detected iteration-based experiment in {path}")
-        return visualize_iterations(path, name)
-    else:
-        # Check if this path might be a base directory containing a queue_X_duration_Y folder
-        queue_dirs = glob.glob(os.path.join(path, 'queue_*_duration_*'))
-        
-        if queue_dirs:
-            # This path contains experiment directories
-            print(f"Detected {len(queue_dirs)} experiment configurations in {path}")
-            
-            for exp_dir in queue_dirs:
-                # Check if this is an iteration experiment
-                if glob.glob(os.path.join(exp_dir, 'iteration_*')):
-                    print(f"Processing iteration experiment: {exp_dir}")
-                    visualize_iterations(exp_dir, name)
-                else:
-                    # This is a single run experiment
-                    single_visualize(exp_dir, name)
-            
-            return path
-        else:
-            # This is a single run experiment
-            return single_visualize(path, name)
-
-def single_visualize(path, name='network_metrics_extended'):
-    """Original visualization function for a single run"""
-    ping_log_path = os.path.join(path, 'ping_result.log')
-    tcp_json_path = os.path.join(path, 'iperf3_tcp.json')
-    udp_json_path = os.path.join(path, 'iperf3_udp.json')
-    output_path = os.path.join(path, f'{name}.png')
-
-    print(f"Using files from: {path}")
-    ping_df = parse_ping_log(ping_log_path)
-    tcp_df = parse_iperf_json(tcp_json_path, offset=3, is_udp=False)
-    udp_df = parse_iperf_json(udp_json_path, offset=8, is_udp=True)
-
-    print(f"Pings: {len(ping_df)}, TCP: {len(tcp_df)}, UDP: {len(udp_df)}")
-
-    plt.figure(figsize=(12, 10))
-
-    # 1) Latenz
-    plt.subplot(4, 1, 1)
-    if not ping_df.is_empty():
-        valid_pings = ping_df.filter(~pl.col("latency_ms").is_nan())
-        plt.plot(valid_pings['experiment_time'], valid_pings['latency_ms'], label='Ping Latenz', color='blue')
-        high_latency = ping_df.filter(pl.col("latency_ms") > 2000)
-        if not high_latency.is_empty():
-            plt.scatter(high_latency["experiment_time"], high_latency["latency_ms"], color='red', label='Extrem hohe Latenz')
-        lost_packets = ping_df.filter(pl.col("latency_ms").is_nan())
-        if not lost_packets.is_empty():
-            plt.scatter(lost_packets['experiment_time'], [plt.gca().get_ylim()[1] * 0.95] * len(lost_packets), marker='x', color='red', label='Paketverlust')
-    plt.ylabel('Latenz (ms)')
-    plt.title('Netzwerkmetriken')
-    plt.grid(True)
-    plt.legend()
-
-    # 2) Durchsatz
-    plt.subplot(4, 1, 2)
-    if not tcp_df.is_empty():
-        plt.plot(tcp_df['experiment_time'], tcp_df['throughput_mbps'], label='TCP Durchsatz')
-    if not udp_df.is_empty():
-        plt.plot(udp_df['experiment_time'], udp_df['throughput_mbps'], label='UDP Durchsatz')
-    plt.ylabel('Durchsatz (Mbps)')
-    plt.grid(True)
-    plt.legend()
-
-    # 3) TCP Retransmissions + Drop-Rate
-    plt.subplot(4, 1, 3)
-    if not tcp_df.is_empty():
-        plt.plot(tcp_df['experiment_time'], tcp_df['retransmits'], label='TCP Retransmits')
-        plt_twin = plt.twinx()
-        plt_twin.plot(tcp_df['experiment_time'], tcp_df['drop_rate_pct'], label='TCP Drop-Rate (%)', color='red', linestyle='--')
-        plt_twin.set_ylabel('Drop-Rate (%)', color='red')
-        plt_twin.tick_params(axis='y', labelcolor='red')
-    plt.ylabel('Retransmits')
-    plt.grid(True)
-    plt.legend()
-
-    # 4) UDP Drop-Rate
-    plt.subplot(4, 1, 4)
-    if not udp_df.is_empty():
-        plt.plot(udp_df['experiment_time'], udp_df['drop_rate_pct'], label='UDP Drop-Rate (%)')
-    plt.ylabel('Drop-Rate (%)')
-    plt.xlabel('Experimentdauer (s)')
-    plt.grid(True)
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(output_path)
-    print(f"Diagram saved in: {output_path}")
-    plt.close()
-    
-    return path
-
-# cli usage
-if __name__ == "__main__":
+def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Visualisiere Netzwerkmetriken')
-    parser.add_argument('--path', '-p', type=str, default='/tmp', help='Pfad zum Ergebnisordner')
-    parser.add_argument('--name', '-n', type=str, default='network_metrics_extended', help='Name der Ausgabedatei')
+    parser = argparse.ArgumentParser(description='Visualize network metrics from experiment data.')
+    parser.add_argument('--path', help='Path to the experiment directory')
+    parser.add_argument('--name', default='network_metrics', help='Base name for output files')
+    
     args = parser.parse_args()
-    visualize(args.path, args.name)
+    
+    visualize_iterations(args.path, args.name)
+
+if __name__ == "__main__":
+    main()
